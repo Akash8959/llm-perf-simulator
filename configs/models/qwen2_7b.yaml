@@ -1,0 +1,13 @@
+# Model Configuration: Qwen2 7B
+# Source: "Qwen2 Technical Report", Yang et al., 2024 (arXiv:2407.10671)
+# Architecture: 28 layers, hidden 3584, 28 Q heads, 4 KV heads (GQA), FFN 18944, Vocab 152064
+name: "qwen2_7b"
+layers: 28
+hidden: 3584
+heads: 28
+kv_heads: 4
+ffn_dim: 18944
+vocab: 152064
+num_experts: 1
+top_k: 1
+shared_experts: 0

@@ -1,0 +1,13 @@
+# Model Configuration: Mistral AI Mixtral 8x7B MoE
+# Source: "Mixtral of Experts", Jiang et al., 2024 (arXiv:2401.04088)
+# Architecture: 32 layers, hidden 4096, 32 Q heads, 8 KV heads (GQA), FFN 14336, Vocab 32000, 8 experts, top-2 active
+name: "mixtral_8x7b"
+layers: 32
+hidden: 4096
+heads: 32
+kv_heads: 8
+ffn_dim: 14336
+vocab: 32000
+num_experts: 8
+top_k: 2
+shared_experts: 0

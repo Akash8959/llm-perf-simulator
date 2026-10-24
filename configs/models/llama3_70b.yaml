@@ -1,0 +1,13 @@
+# Model Configuration: Meta LLaMA 3 70B
+# Source: "The Llama 3 Herd of Models", Dubey et al., 2024 (arXiv:2407.21783)
+# Architecture: 80 layers, hidden 8192, 64 Q heads, 8 KV heads (GQA), FFN 28672, Vocab 128256
+name: "llama3_70b"
+layers: 80
+hidden: 8192
+heads: 64
+kv_heads: 8
+ffn_dim: 28672
+vocab: 128256
+num_experts: 1
+top_k: 1
+shared_experts: 0

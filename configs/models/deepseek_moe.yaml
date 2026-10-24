@@ -1,0 +1,13 @@
+# Model Configuration: DeepSeek-MoE 16B
+# Source: "DeepSeekMoE: Towards Ultimate Expertise in Language Model", Dai et al., 2024 (arXiv:2401.06066)
+# Architecture: 28 layers, hidden 2048, 16 Q heads, 16 KV heads, FFN 1088, Vocab 102400, 64 routed experts, top-6 active, 2 shared experts
+name: "deepseek_moe_16b"
+layers: 28
+hidden: 2048
+heads: 16
+kv_heads: 16
+ffn_dim: 1088
+vocab: 102400
+num_experts: 64
+top_k: 6
+shared_experts: 2
