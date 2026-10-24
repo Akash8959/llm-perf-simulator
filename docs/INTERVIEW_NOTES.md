@@ -99,7 +99,7 @@ $$\text{KV Bytes} = 2 \times 32 \times 8 \times 128 \times 2048 \times 1 \times 
 
 ### Weight Quantization (e.g., FP16 $\to$ INT8 / INT4)
 - Cuts weight parameter bytes from 2.0 bytes to 1.0 byte (INT8) or 0.5 bytes (INT4).
-- **In Decode**: Because decode is memory-bound ($I \approx 1.0$), reducing bytes transferred from 16 GB to 8 GB reduces decode step latency almost linearly ($~50\%$ faster TPOT!).
+- **In Decode**: Because decode is memory-bound, latency scales with bytes moved ($\text{Bytes} = \text{Weights Read} + \text{KV Cache Read}$). INT8 weights alone cut weight bytes by half, but the KV cache still moves at FP16 ($b_{kv} = 2.0\text{ bytes}$), so the gain is slightly under 50% (~48.3% at $B=4, C=1024$) when the KV cache is not quantized; quantizing both weights and KV cache gives exactly 50% reduction in total bytes and latency.
 - **In Prefill**: Because prefill is compute-bound, cutting weight bytes transferred has negligible effect on latency unless the GPU hardware supports higher INT8/INT4 Tensor Core TFLOPs.
 
 ### KV Cache Quantization (e.g., FP16 $\to$ FP8 / INT8)
@@ -159,8 +159,10 @@ $\text{KV Cache Bytes} = 2 \cdot L \cdot n_{kv} \cdot d \cdot C \cdot B \cdot b_
 ### Q6: If decode is memory-bound, will upgrading from H100 to an accelerator with 2x more TFLOPs speed up single-user latency?
 **Answer:** No. Because arithmetic intensity is $~1.0 \text{ FLOP/byte} \ll 221 \text{ FLOP/byte}$, execution is bottlenecked entirely by HBM read bandwidth. Upgrading compute FLOPs yields $<1\%$ improvement; only increasing HBM bandwidth or quantizing weights will improve TPOT.
 
-### Q7: Why does weight quantization to INT8 halve decode latency at batch size 1?
-**Answer:** At batch size 1, decode execution time is dominated by reading weight bytes from HBM: $t_{\text{decode}} \approx \text{Weights Read} / \text{HBM BW}$. INT8 cuts weight parameters from 2 bytes to 1 byte, halving the bytes transferred and halving latency.
+### Q7: Why does INT8 weight quantization yield slightly under 50% decode speedup when the KV cache is not quantized, and what gives exactly 50%?
+**Answer:** Decode is memory-bound, so latency scales with bytes moved from HBM:
+$$t_{\text{decode}} \approx \frac{\text{Weights Read} + \text{KV Cache Read}}{\text{HBM Bandwidth} \times \eta_{\text{memory}}}$$
+INT8 weights alone cut weight bytes by half, but the KV cache still moves at FP16 ($b_{kv} = 2.0\text{ bytes}$). Because this unquantized KV cache traffic remains on the memory bus, the gain is slightly under 50% when the KV cache is not quantized (e.g. 48.3% lower TPOT at $B=4, C=1024$). Quantizing both weights and the KV cache gives exactly 50% latency reduction.
 
 ### Q8: Does INT8 weight quantization significantly reduce prefill latency?
 **Answer:** No. Prefill is heavily compute-bound (arithmetic intensity $>1500 \text{ FLOP/byte}$). The time spent transferring weights from HBM is negligible compared to Tensor Core GEMM compute time. INT8 only speeds up prefill if the GPU tensor cores execute INT8 operations faster.

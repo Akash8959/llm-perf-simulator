@@ -17,7 +17,8 @@ An analytical, roofline-style LLM inference performance simulator. Models latenc
 | **Decode Intensity (C=2048, B=1)** | **1.05 FLOP/byte** | **Memory-bound** ($\ll 221.4$); limited by HBM read bandwidth |
 | **H100 Baseline Decode TPOT** | **6.10 ms / token** | Baseline on H100 SXM5 ($3,350\text{ GB/s}$ HBM3, FP16) |
 | **Decode TPOT with 2x HBM Bandwidth** | **3.05 ms / token** | **$2.0\times$ speedup (50% lower latency)** via memory scaling |
-| **INT8 vs FP16 weight decode latency (B=4, C=1024)** | **3.10 ms vs 6.21 ms** | **50% lower latency** ($2.0\times$ speedup) & 50% memory savings |
+| **INT8 vs FP16 decode latency (B=4, C=1024, weights + KV cache)** | **3.10 ms vs 6.21 ms** | **50.0% lower latency** ($2.0\times$ speedup) & 50.0% memory savings |
+| **INT8 vs FP16 decode latency (B=4, C=1024, weights only)** | **3.21 ms vs 6.21 ms** | **48.3% lower latency** ($1.93\times$ speedup); KV cache remains FP16 |
 
 ---
 
