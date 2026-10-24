@@ -1,193 +1,28 @@
 # llm-perf-simulator
 
+An analytical performance simulator for LLM inference on GPUs. No GPU needed.
+
 [![CI](https://github.com/Akash8959/llm-perf-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/Akash8959/llm-perf-simulator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-An analytical, roofline-style LLM inference performance simulator. Models latency, memory bandwidth bottlenecks, arithmetic intensity, distributed communication overheads, and hardware capacity across prefill and decode phases. **No GPU required.**
+## Why I built this
 
----
+I built this project to understand why LLM inference is slow and what actually limits its speed. When running large language models, the bottleneck changes completely between processing the input prompt and generating output tokens. I wanted a way to calculate and estimate performance across different GPUs, model architectures, and batch sizes without needing access to a real GPU cluster. This is an analytical model based on roofline analysis, not a benchmark run on physical hardware.
 
-## Results at a Glance
+## What it does
 
-| Metric / Scenario | Value | Regime / Key Takeaway |
-| :--- | :--- | :--- |
-| **H100 Hardware Ridge Point** | **221.4 FLOP/byte** | Hardware boundary dividing memory-bound from compute-bound |
-| **Prefill Intensity (S=2048, B=1)** | **2,016 FLOP/byte** | **Compute-bound** ($\gg 221.4$); saturates GPU Tensor Cores |
-| **Decode Intensity (C=2048, B=1)** | **1.05 FLOP/byte** | **Memory-bound** ($\ll 221.4$); limited by HBM read bandwidth |
-| **H100 Baseline Decode TPOT** | **6.10 ms / token** | Baseline on H100 SXM5 ($3,350\text{ GB/s}$ HBM3, FP16) |
-| **Decode TPOT with 2x HBM Bandwidth** | **3.05 ms / token** | **$2.0\times$ speedup (50% lower latency)** via memory scaling |
-| **INT8 vs FP16 decode latency (B=4, C=1024, weights + KV cache)** | **3.10 ms vs 6.21 ms** | **50.0% lower latency** ($2.0\times$ speedup) & 50.0% memory savings |
-| **INT8 vs FP16 decode latency (B=4, C=1024, weights only)** | **3.21 ms vs 6.21 ms** | **48.3% lower latency** ($1.93\times$ speedup); KV cache remains FP16 |
+- Estimates Time to First Token (TTFT), Time Per Output Token (TPOT), and total throughput for prefill and decode phases.
+- Tells whether each phase is compute-bound or memory-bound.
+- Models KV cache memory growth and checks if weights and context fit in GPU memory without running out of memory.
+- Supports precision formats including FP16, INT8, and INT4 for weights and KV cache.
+- Models tensor, pipeline, expert, and data parallelism along with interconnect communication overhead.
+- Runs parameter sweeps and saves plots and CSV files to compare hardware configurations.
 
----
+## Quick start
 
-## 1. Overview
+### Installation
 
-Deploying and sizing Large Language Model (LLM) serving infrastructure requires balancing complex hardware-software interactions:
-- **Prefill (Time to First Token / TTFT)** processes entire input prompt sequences concurrently, driving high arithmetic intensity and saturating GPU Tensor Core compute throughput.
-- **Decode (Time Per Output Token / TPOT)** generates tokens sequentially step-by-step, reading full multi-billion parameter model weights and past Key-Value (KV) cache tensors for each token generated—making generation severely memory bandwidth-bound at small batch sizes.
-- **Distributed Parallelism (TP, PP, DP, EP)** shards weights, KV cache, and computations across multiple GPUs, introducing ring all-reduce and all-to-all communication latency dependent on interconnect link bandwidth.
-
-`llmsim` is a lightweight, rigorous simulator built purely on first-principles analytical roofline models.
-
----
-
-## 2. Architecture
-
-```mermaid
-flowchart TD
-    subgraph Inputs ["1. Configuration Inputs"]
-        HW["GPU Hardware Spec (YAML)<br/>• SM Count, Peak TFLOPs<br/>• HBM Bandwidth, Capacity<br/>• NVLink BW & Latency"]
-        MD["Model Architecture (YAML)<br/>• Layers, Hidden, Heads<br/>• FFN Dim, Vocab, MoE"]
-        CFG["Execution Parameters<br/>• Batch (B), Prompt (S), Gen (O)<br/>• Precision (FP16/INT8/INT4)<br/>• Parallelism (TP, PP, DP, EP)"]
-    end
-
-    subgraph RooflineCore ["2. Analytical Roofline Estimator"]
-        AI["Arithmetic Intensity Engine<br/>• Prefill FLOPs & Traffic<br/>• Decode Step FLOPs & Traffic<br/>• MoE Expert Distinct Hits"]
-        MEM["Memory Fit Checker<br/>• Model Weights per GPU<br/>• KV Cache Footprint<br/>• OOM & Headroom Limits"]
-        COMM["Distributed Interconnect Model<br/>• Ring All-Reduce Latency<br/>• MoE All-to-All Latency<br/>• Pipeline Bubble Overhead"]
-    end
-
-    subgraph SimulationOutputs ["3. Outputs & Diagnostics"]
-        RES["Simulation Metrics<br/>• TTFT (ms), TPOT (ms)<br/>• E2E Latency, Tokens/Sec<br/>• Compute vs Memory Bound"]
-        PLOTS["Visualizations (PNG)<br/>• Roofline Curve with Operating Points<br/>• Latency vs Batch Size<br/>• TPOT vs HBM Bandwidth<br/>• Throughput vs TP Degree"]
-        REC["Executive Recommendations<br/>• Actionable Bottleneck Diagnosis"]
-    end
-
-    Inputs --> RooflineCore
-    RooflineCore --> SimulationOutputs
-```
-
----
-
-## 3. Mathematical Formulations & Worked Example
-
-### 3.1 Notation
-- $L$: Transformer layers
-- $h$: Hidden dimension
-- $n_h$: Query attention heads
-- $n_{kv}$: Key/Value attention heads
-- $d = h / n_h$: Head dimension
-- $d_{ffn}$: Feed-forward intermediate dimension
-- $V$: Vocabulary size
-- $B$: Batch size
-- $S$: Prompt sequence length
-- $C$: Current context length during decode ($C \ge S$)
-- $b_w, b_{kv}, b_{act}$: Bytes per parameter for weights, KV cache, and activations
-
-### 3.2 Key Formulas
-
-1. **Attention Parameters per Layer**:
-
-   $$
-   \text{Params}_{\text{attn}} = 2 \times h^2 + 2 \times h \times n_{kv} \times d
-   $$
-
-2. **SwiGLU FFN Parameters per Layer**:
-
-   $$
-   \text{Params}_{\text{ffn}} = 3 \times h \times d_{ffn}
-   $$
-
-   (For MoE with $E$ experts, top-$k$: Router $h \times E + E \times 3 \times h \times d_{ffn}$)
-
-3. **KV Cache Footprint**:
-
-   $$
-   \text{KV Bytes} = 2 \times L \times n_{kv} \times d \times C \times B \times b_{kv}
-   $$
-
-4. **Prefill Phase (Prompt Evaluation)**:
-
-   $$
-   \text{FLOPs}_{\text{prefill}} = 2 \times \text{Active Params} \times B \times S + 4 \times L \times B \times S^2 \times h
-   $$
-
-   $$
-   \text{Bytes}_{\text{prefill}} = \text{Active Params} \times b_w + 2 \times L \times B \times S \times h \times b_{act} + \text{KV Cache Write}
-   $$
-
-5. **Decode Step Phase (Single Generated Token)**:
-
-   $$
-   \text{FLOPs}_{\text{decode}} = 2 \times \text{Active Params} \times B + 4 \times L \times B \times C \times h
-   $$
-
-   $$
-   \text{Bytes}_{\text{decode}} = \text{Weights Read} + \text{KV Cache Read}
-   $$
-
-   (For MoE: distinct experts hit $E_{\text{hit}} = E \times (1 - (1 - k/E)^B))
-
-6. **Roofline Execution Latency**:
-
-   $$
-   t_{\text{latency}} = \max\left(\frac{\text{FLOPs}}{\text{Peak FLOPs} \times \eta_{\text{compute}}}, \frac{\text{Bytes}}{\text{HBM BW} \times \eta_{\text{memory}}}\right) + t_{\text{comm}}
-   $$
-
-   (Default efficiencies: $\eta_{\text{compute}} = 0.60$, $\eta_{\text{memory}} = 0.80$)
-
-7. **Tensor Parallel Ring All-Reduce Latency**:
-
-   $$
-   t_{\text{ring}} = 2 \times \frac{N_{\text{TP}} - 1}{N_{\text{TP}}} \times \frac{B \times \text{tokens} \times h \times b_{act}}{\text{BW}_{\text{link}}} + (N_{\text{TP}} - 1) \times \tau_{\text{link}}
-   $$
-
----
-
-### 3.3 Worked Example: LLaMA-3-8B on NVIDIA H100 SXM5
-- **Configuration**: Batch $B = 1$, Context $C = 2048$, Precision = FP16 ($b_w = 2, b_{kv} = 2$), H100 (989 TFLOPs FP16, 3350 GB/s HBM3).
-
-| Metric | Calculation | Value |
-| :--- | :--- | :--- |
-| **Model Weights** | $2 \times 128256 \times 4096 + 32 \times (41.94\text{M} + 176.16\text{M})$ | 8,029,995,008 params (14.96 GB) |
-| **KV Cache** | $2 \times 32 \times 8 \times 128 \times 2048 \times 1 \times 2$ | 268,435,456 bytes (256 MB) |
-| **Effective Ridge Point** | $\frac{989 \times 10^{12} \times 0.60}{3350 \times 10^9 \times 0.80}$ | **221.42 FLOP/byte** |
-| **Prefill FLOPs** | $2 \times 8.03\text{B} \times 1 \times 2048 + 4 \times 32 \times 1 \times 2048^2 \times 4096$ | 35.09 TFLOPs |
-| **Prefill Bytes** | Weights (16.06 GB) + Act (1.07 GB) + KV (0.27 GB) | 17.40 GB |
-| **Prefill Intensity** | $35.09 \times 10^{12} / 17.40 \times 10^9$ | **2,016.41 FLOP/byte** ($\gg 221.42 \implies$ **Compute-Bound**) |
-| **Prefill TTFT** | $\max(35.09\text{T} / (989\text{T} \times 0.6), 17.40\text{GB} / (3350\text{GB/s} \times 0.8))$ | **59.13 ms** |
-| **Decode Step FLOPs** | $2 \times 8.03\text{B} \times 1 + 4 \times 32 \times 1 \times 2048 \times 4096$ | 17.13 GFLOPs |
-| **Decode Step Bytes** | Weights (16.06 GB) + KV Read (0.27 GB) | 16.33 GB |
-| **Decode Intensity** | $17.13 \times 10^9 / 16.33 \times 10^9$ | **1.05 FLOP/byte** ($\ll 221.42 \implies$ **Memory-Bound**) |
-| **Decode Step TPOT** | $\max(17.13\text{G} / (989\text{T} \times 0.6), 16.33\text{GB} / (3350\text{GB/s} \times 0.8))$ | **6.09 ms** |
-
----
-
-## 4. Sample Results & Visualizations
-
-Running the complete sweep suite (`examples/run_all_sweeps.py`) yields the following performance profiles in `results/`:
-
-### 4.1 Roofline Chart
-The log-log roofline curve plots operational intensity against attainable compute throughput, highlighting why prefill and decode reside on opposite sides of the hardware ridge point.
-
-![Roofline Chart](results/roofline_chart.png)
-
-### 4.2 Decode TPOT vs HBM Bandwidth
-Decode latency is strictly inverse to memory bandwidth. Doubling HBM bandwidth yields a ~50% reduction in token generation latency.
-
-![TPOT vs HBM](results/tpot_vs_hbm.png)
-
-### 4.3 Latency vs Batch Size
-Prefill latency scales linearly with batch size, while decode latency amortizes weight loads across sequences, increasing throughput until compute saturation.
-
-![Latency vs Batch Size](results/latency_vs_batch.png)
-
-### 4.4 Throughput vs Tensor Parallel Degree
-Demonstrates the impact of interconnect bandwidth (PCIe vs NVLink) on multi-GPU scaling efficiency.
-
-![Throughput vs TP](results/throughput_vs_tp.png)
-
-### 4.5 Performance Summary Table
-![Bottleneck Summary](results/bottleneck_summary.png)
-
----
-
-## 5. Installation & Usage
-
-### 5.1 Installation
-Requires Python 3.10+:
+Clone the repository and install the dependencies in a virtual environment:
 
 ```bash
 git clone https://github.com/Akash8959/llm-perf-simulator.git
@@ -197,72 +32,208 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt -e .
 ```
 
-### 5.2 Command-Line Interface (CLI)
+### Run a simulation
 
-Run single configuration simulation:
+Run a single simulation from the command line:
+
 ```bash
 python -m llmsim.cli \
   --hardware configs/hardware/h100_sxm.yaml \
   --model configs/models/llama3_8b.yaml \
-  --batch 16 \
+  --batch 1 \
   --prompt-len 2048 \
-  --output-len 256 \
-  --tp 2 \
-  --quant int8
+  --output-len 128
 ```
 
-Run a parametric sweep and generate visualizations:
-```bash
-python -m llmsim.cli \
-  --hardware configs/hardware/h100_sxm.yaml \
-  --model configs/models/llama3_8b.yaml \
-  --sweep hbm \
-  --plot \
-  --out-dir results
+Sample CLI output:
+
+```text
+==============================================================================
+LLM PERFORMANCE SIMULATOR: LLAMA3_8B ON H100_SXM
+==============================================================================
+Metric                         | Value     | Unit / Note       
+-------------------------------+-----------+-------------------
+Time to First Token (TTFT)     | 59.13     | ms                
+Time Per Output Token (TPOT)   | 6.10      | ms / token        
+End-to-End Latency             | 0.839     | seconds           
+Generation Throughput          | 152.5     | tokens / sec      
+Peak Memory Per GPU            | 15.22     | GB                
+Prefill Bottleneck Regime      | COMPUTE   | compute / memory  
+Decode Bottleneck Regime       | MEMORY    | compute / memory  
+Inter-GPU Comm Overhead        | 0.0%      | of e2e latency    
+Memory Headroom Utilization    | 19.0%     | of capacity       
+Out-of-Memory (OOM) Status     | FIT       | Status            
 ```
 
-Run all sweeps and generate CSVs and plots:
+### Run all sweeps
+
+To run all parameter sweeps and generate the CSV files and plots in `results/`:
+
 ```bash
 python examples/run_all_sweeps.py
 ```
 
-### 5.3 Python API
+## Results
 
-```python
-from llmsim.hardware import load_gpu
-from llmsim.model import load_model
-from llmsim.simulator import simulate
-from llmsim.parallelism import ParallelConfig
+Here are the key numbers from running the simulator for LLaMA-3-8B on an NVIDIA H100 SXM5 GPU:
 
-gpu = load_gpu("configs/hardware/h100_sxm.yaml")
-model = load_model("configs/models/llama3_8b.yaml")
+| Metric / Scenario | Value | Bottleneck / Note |
+| :--- | :--- | :--- |
+| Hardware ridge point | 221.4 FLOP/byte | Threshold between memory-bound and compute-bound |
+| Prefill arithmetic intensity (batch 1, prompt 2048) | 2016.4 FLOP/byte | Compute-bound (well above 221.4) |
+| Decode arithmetic intensity (batch 1, context 2048) | 1.05 FLOP/byte | Memory-bound (well below 221.4) |
+| Decode TPOT at baseline (batch 1, context 2048) | 6.09 ms / token | Limited by 3350 GB/s HBM bandwidth |
+| Decode TPOT with 2x HBM bandwidth | 3.05 ms / token | 2.0x speedup (50.0% lower latency) |
+| INT8 vs FP16 decode latency (batch 4, context 1024, weights only) | 3.21 ms vs 6.21 ms | 48.3% lower latency (1.93x speedup, KV cache stays FP16) |
+| INT8 vs FP16 decode latency (batch 4, context 1024, weights + KV cache) | 3.10 ms vs 6.21 ms | 50.0% lower latency (2.0x speedup, both weights and KV in INT8) |
 
-res = simulate(
-    gpu=gpu,
-    model=model,
-    batch=8,
-    prompt_len=1024,
-    output_len=128,
-    parallel=ParallelConfig(tp=2),
-    weight_precision="int8",
-    kv_precision="fp16",
-)
+### Visualizations
 
-print(f"TTFT: {res.ttft * 1e3:.2f} ms")
-print(f"TPOT: {res.tpot * 1e3:.2f} ms")
-print(f"Throughput: {res.tokens_per_sec:.1f} tokens/sec")
-print(f"Memory: {res.memory_per_gpu_gb:.2f} GB (Fits: {not res.is_oom})")
+![Roofline Chart](results/roofline_chart.png)
+The roofline curve shows that prefill sits on the compute ceiling while decode sits down on the memory bandwidth slope.
+
+![TPOT vs HBM](results/tpot_vs_hbm.png)
+Decode latency drops almost linearly as memory bandwidth increases because reading weights from memory is the main bottleneck.
+
+![Latency vs Batch Size](results/latency_vs_batch.png)
+Prefill latency increases with batch size, while decode latency per token stays flat until batch size grows large enough to saturate compute.
+
+![Throughput vs TP](results/throughput_vs_tp.png)
+Tensor parallelism scales well on high-bandwidth NVLink, but communication overhead hurts scaling on slower PCIe interconnects.
+
+![Bottleneck Summary](results/bottleneck_summary.png)
+Summary comparison across different serving configurations, showing where execution time is spent.
+
+## How the model works
+
+### 1. Parameter count
+I calculate the attention and feed-forward parameters for each transformer layer based on hidden size, head dimensions, and intermediate dimension. For SwiGLU, the feed-forward network has three weight matrices (gate, up, and down projections).
+
+```text
+attention_params = (2 * hidden * hidden) + (2 * hidden * kv_heads * head_dim)
+ffn_params = 3 * hidden * ffn_dim
+layer_params = attention_params + ffn_params
+total_params = embedding_params + (layers * layer_params)
 ```
 
----
+For Mixture of Experts (MoE) models, the router has `hidden * num_experts` parameters, and only `top_k` routed experts plus shared experts are active per token.
 
-## 6. Adding New Hardware or Model Configurations
+### 2. KV cache size
+Every generated token appends a Key vector and a Value vector to the cache for every layer and Key-Value head. The total size grows with batch size and context length.
+
+```text
+kv_cache_bytes = 2 * layers * kv_heads * head_dim * context * batch * bytes_per_element
+```
+
+For LLaMA-3-8B in FP16 with batch 1 and context 2048, the KV cache uses 256 MB.
+
+### 3. Prefill phase (FLOPs and bytes)
+During prefill, the model processes the entire prompt sequence at once using matrix-matrix multiplications (GEMM). Because the GPU reuses model weights across all prompt tokens, prefill has high arithmetic intensity and is compute-bound.
+
+```text
+prefill_flops = (2 * active_params * batch * prompt_len) + (4 * layers * batch * prompt_len^2 * hidden)
+prefill_bytes = (active_params * bytes_per_weight) + (2 * layers * batch * prompt_len * hidden * bytes_per_act) + kv_write_bytes
+```
+
+### 4. Decode phase (FLOPs and bytes)
+During decode, the model generates one token at a time using matrix-vector multiplications (GEMV). Because the GPU must read all model weights from memory just to generate a single token, decode has low arithmetic intensity and is memory-bound.
+
+```text
+decode_flops = (2 * active_params * batch) + (4 * layers * batch * context * hidden)
+decode_bytes = weights_read + kv_cache_read
+```
+
+For MoE models during batched decode, the expected number of distinct experts loaded per step is modeled as:
+
+```text
+distinct_experts = num_experts * (1 - (1 - top_k / num_experts)^batch)
+```
+
+### 5. Latency calculation
+Execution time is determined by whichever takes longer: compute time or memory transfer time, plus communication time if using multiple GPUs.
+
+```text
+compute_time = flops / (peak_flops * compute_efficiency)
+memory_time = bytes / (hbm_bandwidth * memory_efficiency)
+latency = max(compute_time, memory_time) + communication_time
+```
+
+I use default efficiency factors of 0.60 for compute and 0.80 for memory bandwidth based on typical sustained GPU utilization in inference.
+
+### 6. Arithmetic intensity and ridge point
+Arithmetic intensity measures how many floating-point operations the GPU performs for every byte read from memory. The ridge point marks where the hardware transitions from memory-bound to compute-bound.
+
+```text
+arithmetic_intensity = flops / bytes
+ridge_point = (peak_flops * compute_efficiency) / (hbm_bandwidth * memory_efficiency)
+```
+
+If arithmetic intensity is below the ridge point, execution is memory-bound. If it is above, execution is compute-bound.
+
+### 7. Tensor parallel communication
+Tensor parallelism shards weight matrices across multiple GPUs, which requires two ring all-reduce operations per transformer layer for each token.
+
+```text
+allreduce_time = 2 * ((tp_size - 1) / tp_size) * (message_bytes / link_bandwidth) + (tp_size - 1) * link_latency
+comm_time = 2 * layers * allreduce_time
+```
+
+## Project structure
+
+```text
+.
+├── .github/workflows/ci.yml    # GitHub Actions workflow for tests and linting
+├── .gitignore                  # Git ignore rules for virtualenvs and caches
+├── LICENSE                     # MIT license
+├── README.md                   # Project documentation
+├── pyproject.toml              # Build setup, dependencies, pytest and ruff config
+├── requirements.txt            # Python dependencies
+├── configs/
+│   ├── hardware/               # GPU hardware specs (SMs, TFLOPs, HBM, NVLink)
+│   │   ├── a100_80gb.yaml
+│   │   └── h100_sxm.yaml
+│   └── models/                 # Transformer architecture specs
+│       ├── deepseek_moe.yaml
+│       ├── llama3_70b.yaml
+│       ├── llama3_8b.yaml
+│       ├── mixtral_8x7b.yaml
+│       └── qwen2_7b.yaml
+├── examples/
+│   └── run_all_sweeps.py       # Script that runs all sweeps and generates plots
+├── results/                    # Saved plots and CSV sweep data
+│   ├── bottleneck_summary.png
+│   ├── latency_vs_batch.png
+│   ├── roofline_chart.png
+│   ├── throughput_vs_tp.png
+│   ├── tpot_vs_hbm.png
+│   └── sweep_*.csv
+├── src/llmsim/                 # Core simulator package
+│   ├── __init__.py             # Package init and version
+│   ├── cli.py                  # Command-line interface
+│   ├── estimator.py            # FLOPs, memory traffic, and roofline formulas
+│   ├── hardware.py             # GPU hardware configuration loader and dataclass
+│   ├── model.py                # Model architecture loader and parameter counts
+│   ├── parallelism.py          # Parallelism configs and communication models
+│   ├── plots.py                # Matplotlib visualization routines
+│   ├── quantization.py         # Precision types and byte sizes (FP16, INT8, INT4)
+│   ├── recommend.py            # Bottleneck diagnosis and summary generator
+│   ├── simulator.py            # End-to-end simulation runner across prefill and decode
+│   └── sweep.py                # Parameter sweep functions returning DataFrames
+└── tests/                      # Automated test suite
+    ├── test_cli.py
+    ├── test_configs.py
+    ├── test_estimator.py
+    ├── test_parallelism.py
+    ├── test_simulator.py
+    └── test_sweeps.py
+```
+
+## Adding a GPU or model
 
 ### Adding a GPU
 Create a new YAML file in `configs/hardware/<gpu_name>.yaml`:
+
 ```yaml
-# Hardware Configuration: Custom Accelerator
-# Source: Datasheet specification URL
 name: "custom_gpu"
 sm_count: 128
 peak_tflops_fp16: 800.0
@@ -276,44 +247,38 @@ interconnect_bandwidth_gbps: 800.0
 interconnect_latency_us: 2.5
 ```
 
-### Adding a Model
+### Adding a model
 Create a new YAML file in `configs/models/<model_name>.yaml`:
+
 ```yaml
-# Model Configuration: Custom Transformer
-# Source: Architecture paper citation
 name: "custom_model"
 layers: 32
 hidden: 4096
 heads: 32
-kv_heads: 8           # Set < heads for Grouped-Query Attention (GQA)
+kv_heads: 8           # Set smaller than heads for GQA
 ffn_dim: 14336
 vocab: 128256
-num_experts: 1        # > 1 for MoE architectures
+num_experts: 1        # Set > 1 for MoE
 top_k: 1              # Active routed experts per token
 shared_experts: 0     # Shared always-active experts
 ```
 
----
+## Limitations
 
-## 7. Assumptions & Limitations
+- It is an analytical estimate, not a measurement from physical hardware.
+- The hardware efficiency factors (0.60 for compute, 0.80 for memory bandwidth) are assumed averages. Real workloads vary with kernel tuning and sequence lengths.
+- It ignores CUDA kernel launch overheads (typically 3 to 10 microseconds per kernel), which can add latency for small models or short operations.
+- It does not model request scheduling or continuous batching (iteration-level scheduling).
+- It assumes sequential execution where communication adds linearly to compute or memory time, ignoring potential overlap between compute and communication.
+- It counts the full embedding table in FLOPs and memory traffic even though an embedding lookup only needs a small slice of that table, which slightly overstates the numbers.
+- I have not validated these estimates against real GPU measurements yet.
 
-1. **Empirical Efficiency Factors**: Default hardware efficiencies ($\eta_{\text{compute}} = 0.60$, $\eta_{\text{memory}} = 0.80$) represent sustained hardware utilization. Real workloads vary based on sequence padding and kernel tuning.
-2. **No Kernel-Level Overhead**: Assumes idealized memory coalescing and tensor core execution. Ignores CUDA kernel launch latencies (~5-10 $\mu$s per kernel), quantization dequantization runtime overhead, and on-chip SRAM register spill.
-3. **No Dynamic Scheduling or Queueing**: Models synchronous inference for a static batch. Does not model continuous batching (iteration-level scheduling) or request arrival Poisson distributions.
-4. **Compute / Communication Overlap Ignored**: Assumes sequential execution where communication adds linearly to compute/memory latency ($t = \max(t_{\text{comp}}, t_{\text{mem}}) + t_{\text{comm}}$). In advanced frameworks, All-Reduce operations can partially overlap with layer computation.
-5. **Validation & Modeling Scope**: All reported figures are analytical, first-principles roofline estimates rather than measured empirical benchmarks. Real-world systems running production inference frameworks (such as vLLM, TensorRT-LLM, or TGI) will exhibit higher latencies due to CUDA kernel launch overheads, host runtime scheduling, non-contiguous memory allocations, and driver synchronization.
+## What I want to add next
 
----
+- Validate the predictions against real measurements from serving engines like vLLM or Ollama.
+- Add a simulation model for continuous batching and dynamic request arrivals.
+- Support newer low-precision formats like FP8 and FP4 for Blackwell and Hopper architectures.
 
-## 8. Extension Ideas
+## License
 
-- **Speculative Decoding**: Analytical speedup modeling based on small draft model acceptance rate distributions.
-- **Prefix Caching & Context Sharing**: Accounting for shared system prompt KV cache reuse across conversations.
-- **Microscaling / FP4 Precision**: Adding Blackwell / Hopper FP4 quantization and sub-byte memory traffic calculations.
-- **Pipeline Bubble Scheduling**: Simulating 1F1B and Zero-Bubble pipeline schedules with activation memory staging.
-
----
-
-## 9. License
-
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the MIT License.
