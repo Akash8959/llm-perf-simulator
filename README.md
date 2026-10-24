@@ -1,10 +1,23 @@
 # llm-perf-simulator
 
-![CI](https://github.com/Akash8959/llm-perf-simulator/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/Akash8959/llm-perf-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/Akash8959/llm-perf-simulator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 An analytical, roofline-style LLM inference performance simulator. Models latency, memory bandwidth bottlenecks, arithmetic intensity, distributed communication overheads, and hardware capacity across prefill and decode phases. **No GPU required.**
+
+---
+
+## Results at a Glance
+
+| Metric / Scenario | Value | Regime / Key Takeaway |
+| :--- | :--- | :--- |
+| **H100 Hardware Ridge Point** | **221.4 FLOP/byte** | Hardware boundary dividing memory-bound from compute-bound |
+| **Prefill Intensity (S=2048, B=1)** | **2,016 FLOP/byte** | **Compute-bound** ($\gg 221.4$); saturates GPU Tensor Cores |
+| **Decode Intensity (C=2048, B=1)** | **1.05 FLOP/byte** | **Memory-bound** ($\ll 221.4$); limited by HBM read bandwidth |
+| **H100 Baseline Decode TPOT** | **6.10 ms / token** | Baseline on H100 SXM5 ($3,350\text{ GB/s}$ HBM3, FP16) |
+| **Decode TPOT with 2x HBM Bandwidth** | **3.05 ms / token** | **$2.0\times$ speedup (50% lower latency)** via memory scaling |
+| **INT8 vs FP16 weight decode latency (B=4, C=1024)** | **3.10 ms vs 6.21 ms** | **50% lower latency** ($2.0\times$ speedup) & 50% memory savings |
 
 ---
 
@@ -23,19 +36,19 @@ Deploying and sizing Large Language Model (LLM) serving infrastructure requires 
 
 ```mermaid
 flowchart TD
-    subgraph Inputs["1. Configuration Inputs"]
+    subgraph Inputs ["1. Configuration Inputs"]
         HW["GPU Hardware Spec (YAML)<br/>• SM Count, Peak TFLOPs<br/>• HBM Bandwidth, Capacity<br/>• NVLink BW & Latency"]
         MD["Model Architecture (YAML)<br/>• Layers, Hidden, Heads<br/>• FFN Dim, Vocab, MoE"]
         CFG["Execution Parameters<br/>• Batch (B), Prompt (S), Gen (O)<br/>• Precision (FP16/INT8/INT4)<br/>• Parallelism (TP, PP, DP, EP)"]
     end
 
-    subgraph RooflineCore["2. Analytical Roofline Estimator"]
+    subgraph RooflineCore ["2. Analytical Roofline Estimator"]
         AI["Arithmetic Intensity Engine<br/>• Prefill FLOPs & Traffic<br/>• Decode Step FLOPs & Traffic<br/>• MoE Expert Distinct Hits"]
         MEM["Memory Fit Checker<br/>• Model Weights per GPU<br/>• KV Cache Footprint<br/>• OOM & Headroom Limits"]
         COMM["Distributed Interconnect Model<br/>• Ring All-Reduce Latency<br/>• MoE All-to-All Latency<br/>• Pipeline Bubble Overhead"]
     end
 
-    subgraph SimulationOutputs["3. Outputs & Diagnostics"]
+    subgraph SimulationOutputs ["3. Outputs & Diagnostics"]
         RES["Simulation Metrics<br/>• TTFT (ms), TPOT (ms)<br/>• E2E Latency, Tokens/Sec<br/>• Compute vs Memory Bound"]
         PLOTS["Visualizations (PNG)<br/>• Roofline Curve with Operating Points<br/>• Latency vs Batch Size<br/>• TPOT vs HBM Bandwidth<br/>• Throughput vs TP Degree"]
         REC["Executive Recommendations<br/>• Actionable Bottleneck Diagnosis"]
@@ -63,25 +76,62 @@ flowchart TD
 - $b_w, b_{kv}, b_{act}$: Bytes per parameter for weights, KV cache, and activations
 
 ### 3.2 Key Formulas
+
 1. **Attention Parameters per Layer**:
-   $$\text{Params}_{\text{attn}} = 2 \cdot h^2 + 2 \cdot h \cdot n_{kv} \cdot d$$
+
+   $$
+   \text{Params}_{\text{attn}} = 2 \times h^2 + 2 \times h \times n_{kv} \times d
+   $$
+
 2. **SwiGLU FFN Parameters per Layer**:
-   $$\text{Params}_{\text{ffn}} = 3 \cdot h \cdot d_{ffn}$$
-   *(For MoE with $E$ experts, top-$k$: Router $h \cdot E + E \cdot 3 \cdot h \cdot d_{ffn}$)*
+
+   $$
+   \text{Params}_{\text{ffn}} = 3 \times h \times d_{ffn}
+   $$
+
+   (For MoE with $E$ experts, top-$k$: Router $h \times E + E \times 3 \times h \times d_{ffn}$)
+
 3. **KV Cache Footprint**:
-   $$\text{KV Bytes} = 2 \cdot L \cdot n_{kv} \cdot d \cdot C \cdot B \cdot b_{kv}$$
+
+   $$
+   \text{KV Bytes} = 2 \times L \times n_{kv} \times d \times C \times B \times b_{kv}
+   $$
+
 4. **Prefill Phase (Prompt Evaluation)**:
-   $$\text{FLOPs}_{\text{prefill}} = 2 \cdot \text{Active Params} \cdot B \cdot S + 4 \cdot L \cdot B \cdot S^2 \cdot h$$
-   $$\text{Bytes}_{\text{prefill}} = \text{Active Params} \cdot b_w + 2 \cdot L \cdot B \cdot S \cdot h \cdot b_{act} + \text{KV Cache Write}$$
+
+   $$
+   \text{FLOPs}_{\text{prefill}} = 2 \times \text{Active Params} \times B \times S + 4 \times L \times B \times S^2 \times h
+   $$
+
+   $$
+   \text{Bytes}_{\text{prefill}} = \text{Active Params} \times b_w + 2 \times L \times B \times S \times h \times b_{act} + \text{KV Cache Write}
+   $$
+
 5. **Decode Step Phase (Single Generated Token)**:
-   $$\text{FLOPs}_{\text{decode}} = 2 \cdot \text{Active Params} \cdot B + 4 \cdot L \cdot B \cdot C \cdot h$$
-   $$\text{Bytes}_{\text{decode}} = \text{Weights Read} + \text{KV Cache Read}$$
-   *(For MoE: distinct experts hit $E_{\text{hit}} = E \cdot (1 - (1 - k/E)^B)$)*
+
+   $$
+   \text{FLOPs}_{\text{decode}} = 2 \times \text{Active Params} \times B + 4 \times L \times B \times C \times h
+   $$
+
+   $$
+   \text{Bytes}_{\text{decode}} = \text{Weights Read} + \text{KV Cache Read}
+   $$
+
+   (For MoE: distinct experts hit $E_{\text{hit}} = E \times (1 - (1 - k/E)^B))
+
 6. **Roofline Execution Latency**:
-   $$t_{\text{latency}} = \max\left(\frac{\text{FLOPs}}{\text{Peak FLOPs} \cdot \eta_{\text{compute}}}, \frac{\text{Bytes}}{\text{HBM BW} \cdot \eta_{\text{memory}}}\right) + t_{\text{comm}}$$
-   *(Default efficiencies: $\eta_{\text{compute}} = 0.60$, $\eta_{\text{memory}} = 0.80$)*
+
+   $$
+   t_{\text{latency}} = \max\left(\frac{\text{FLOPs}}{\text{Peak FLOPs} \times \eta_{\text{compute}}}, \frac{\text{Bytes}}{\text{HBM BW} \times \eta_{\text{memory}}}\right) + t_{\text{comm}}
+   $$
+
+   (Default efficiencies: $\eta_{\text{compute}} = 0.60$, $\eta_{\text{memory}} = 0.80$)
+
 7. **Tensor Parallel Ring All-Reduce Latency**:
-   $$t_{\text{ring}} = 2 \cdot \frac{N_{\text{TP}} - 1}{N_{\text{TP}}} \cdot \frac{B \cdot \text{tokens} \cdot h \cdot b_{act}}{\text{BW}_{\text{link}}} + (N_{\text{TP}} - 1) \cdot \tau_{\text{link}}$$
+
+   $$
+   t_{\text{ring}} = 2 \times \frac{N_{\text{TP}} - 1}{N_{\text{TP}}} \times \frac{B \times \text{tokens} \times h \times b_{act}}{\text{BW}_{\text{link}}} + (N_{\text{TP}} - 1) \times \tau_{\text{link}}
+   $$
 
 ---
 
@@ -90,17 +140,17 @@ flowchart TD
 
 | Metric | Calculation | Value |
 | :--- | :--- | :--- |
-| **Model Weights** | $2 \cdot 128256 \cdot 4096 + 32 \cdot (41.94\text{M} + 176.16\text{M})$ | 8,029,995,008 params (14.96 GB) |
-| **KV Cache** | $2 \cdot 32 \cdot 8 \cdot 128 \cdot 2048 \cdot 1 \cdot 2$ | 268,435,456 bytes (256 MB) |
+| **Model Weights** | $2 \times 128256 \times 4096 + 32 \times (41.94\text{M} + 176.16\text{M})$ | 8,029,995,008 params (14.96 GB) |
+| **KV Cache** | $2 \times 32 \times 8 \times 128 \times 2048 \times 1 \times 2$ | 268,435,456 bytes (256 MB) |
 | **Effective Ridge Point** | $\frac{989 \times 10^{12} \times 0.60}{3350 \times 10^9 \times 0.80}$ | **221.42 FLOP/byte** |
-| **Prefill FLOPs** | $2 \cdot 8.03\text{B} \cdot 1 \cdot 2048 + 4 \cdot 32 \cdot 1 \cdot 2048^2 \cdot 4096$ | 35.09 TFLOPs |
+| **Prefill FLOPs** | $2 \times 8.03\text{B} \times 1 \times 2048 + 4 \times 32 \times 1 \times 2048^2 \times 4096$ | 35.09 TFLOPs |
 | **Prefill Bytes** | Weights (16.06 GB) + Act (1.07 GB) + KV (0.27 GB) | 17.40 GB |
 | **Prefill Intensity** | $35.09 \times 10^{12} / 17.40 \times 10^9$ | **2,016.41 FLOP/byte** ($\gg 221.42 \implies$ **Compute-Bound**) |
-| **Prefill TTFT** | $\max(35.09\text{T} / (989\text{T} \cdot 0.6), 17.40\text{GB} / (3350\text{GB/s} \cdot 0.8))$ | **59.13 ms** |
-| **Decode Step FLOPs** | $2 \cdot 8.03\text{B} \cdot 1 + 4 \cdot 32 \cdot 1 \cdot 2048 \cdot 4096$ | 17.13 GFLOPs |
+| **Prefill TTFT** | $\max(35.09\text{T} / (989\text{T} \times 0.6), 17.40\text{GB} / (3350\text{GB/s} \times 0.8))$ | **59.13 ms** |
+| **Decode Step FLOPs** | $2 \times 8.03\text{B} \times 1 + 4 \times 32 \times 1 \times 2048 \times 4096$ | 17.13 GFLOPs |
 | **Decode Step Bytes** | Weights (16.06 GB) + KV Read (0.27 GB) | 16.33 GB |
 | **Decode Intensity** | $17.13 \times 10^9 / 16.33 \times 10^9$ | **1.05 FLOP/byte** ($\ll 221.42 \implies$ **Memory-Bound**) |
-| **Decode Step TPOT** | $\max(17.13\text{G} / (989\text{T} \cdot 0.6), 16.33\text{GB} / (3350\text{GB/s} \cdot 0.8))$ | **6.09 ms** |
+| **Decode Step TPOT** | $\max(17.13\text{G} / (989\text{T} \times 0.6), 16.33\text{GB} / (3350\text{GB/s} \times 0.8))$ | **6.09 ms** |
 
 ---
 
@@ -249,7 +299,8 @@ shared_experts: 0     # Shared always-active experts
 1. **Empirical Efficiency Factors**: Default hardware efficiencies ($\eta_{\text{compute}} = 0.60$, $\eta_{\text{memory}} = 0.80$) represent sustained hardware utilization. Real workloads vary based on sequence padding and kernel tuning.
 2. **No Kernel-Level Overhead**: Assumes idealized memory coalescing and tensor core execution. Ignores CUDA kernel launch latencies (~5-10 $\mu$s per kernel), quantization dequantization runtime overhead, and on-chip SRAM register spill.
 3. **No Dynamic Scheduling or Queueing**: Models synchronous inference for a static batch. Does not model continuous batching (iteration-level scheduling) or request arrival Poisson distributions.
-4. **Compute / Communication Overlap Ignored**: Assumes sequential execution where communication adds linearly to compute/memory latency ($t = \max(t_{\text{comp}}, t_{\text{mem}}) + t_{\text{comm}}$). In advanced frameworks, All-Reduce operations can partially overlap with backward/forward activations.
+4. **Compute / Communication Overlap Ignored**: Assumes sequential execution where communication adds linearly to compute/memory latency ($t = \max(t_{\text{comp}}, t_{\text{mem}}) + t_{\text{comm}}$). In advanced frameworks, All-Reduce operations can partially overlap with layer computation.
+5. **Validation & Modeling Scope**: All reported figures are analytical, first-principles roofline estimates rather than measured empirical benchmarks. Real-world systems running production inference frameworks (such as vLLM, TensorRT-LLM, or TGI) will exhibit higher latencies due to CUDA kernel launch overheads, host runtime scheduling, non-contiguous memory allocations, and driver synchronization.
 
 ---
 
